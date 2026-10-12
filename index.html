@@ -43,6 +43,9 @@ button:focus-visible,input:focus-visible{outline:2px solid var(--accent);outline
 .meta{color:var(--muted);font-size:.85rem}
 .skip{background:var(--warn-bg);color:var(--warn);padding:6px 10px;border-radius:8px;font-size:.85rem;font-weight:600}
 .err{color:#dc2626;font-size:.85rem}
+.bar input[type=number]{font:inherit;width:6em;padding:4px 6px;border:1px solid var(--border);border-radius:6px;background:var(--surface);color:var(--text)}
+.bar input[type=number].invalid{border-color:#dc2626;outline:2px solid #dc2626}
+.hint{color:var(--muted);font-size:.85rem}
 .empty{color:var(--muted);text-align:center;padding:24px 0}
 </style>
 </head>
@@ -63,6 +66,13 @@ button:focus-visible,input:focus-visible{outline:2px solid var(--accent);outline
       <label><input type="radio" name="fmt" value="jpg" checked> JPG（品質0.95）</label>
       <label><input type="radio" name="fmt" value="png"> PNG</label>
     </fieldset>
+    <fieldset>
+      <legend>出力サイズ</legend>
+      <label><input type="radio" name="size" value="width" checked> 横幅を指定</label>
+      <span><input type="number" id="outw" value="640" min="16" max="8000" step="1" aria-label="出力の横幅（px）"> px</span>
+      <span class="hint" id="sizeHint">→ 640×360</span>
+      <label><input type="radio" name="size" value="orig"> リサイズしない（元の高さのまま）</label>
+    </fieldset>
     <span class="spacer"></span>
     <button type="button" class="primary" id="zip" disabled>すべてZIPでダウンロード</button>
     <button type="button" id="clear" disabled>クリア</button>
@@ -80,8 +90,28 @@ button:focus-visible,input:focus-visible{outline:2px solid var(--accent);outline
   var $ = function(id){ return document.getElementById(id); };
   var grid = $('grid'), empty = $('empty'), zipBtn = $('zip'), clearBtn = $('clear'), drop = $('drop');
   var seq = 0;
+  var outwInput = $('outw'), sizeHint = $('sizeHint');
+  var lastW = 640; // 直近の有効な横幅指定（入力が不正な間もこの値で加工する）
 
   function fmt(){ return document.querySelector('input[name="fmt"]:checked').value; }
+  function sizeMode(){ return document.querySelector('input[name="size"]:checked').value; }
+
+  // 横幅入力の検証（空・小数・範囲外は null）
+  function readWidth(){
+    var v = outwInput.value.trim();
+    if (!/^\d+$/.test(v)) return null;
+    var n = parseInt(v, 10);
+    return (n >= 16 && n <= 8000) ? n : null;
+  }
+
+  // 高さ表示の更新（リサイズしない時は入力欄を無効化して表示を消す）
+  function updateHint(){
+    var n = readWidth();
+    sizeHint.textContent = n === null ? '' : '→ ' + n + '×' + Math.round(n * 9 / 16);
+    var off = sizeMode() === 'orig';
+    outwInput.disabled = off;
+    if (off) sizeHint.textContent = '';
+  }
 
   function loadImage(file){
     return new Promise(function(res, rej){
@@ -97,27 +127,52 @@ button:focus-visible,input:focus-visible{outline:2px solid var(--accent);outline
     return new Promise(function(res){ canvas.toBlob(res, type, q); });
   }
 
-  // 加工本体: 幅計算・配置
+  // 加工本体: 幅計算・配置（横幅指定時は最後に段階縮小）
   async function process(it){
     var w = it.w, h = it.h;
-    var outW = Math.round(h * 16 / 9);
-    if (w >= outW){ it.skip = true; return; }
+    var baseW = Math.round(h * 16 / 9);
+    if (w >= baseW){ it.skip = true; return; }
     it.skip = false;
     var canvas = document.createElement('canvas');
-    canvas.width = outW; canvas.height = h;
+    canvas.width = baseW; canvas.height = h;
     var ctx = canvas.getContext('2d');
     ctx.fillStyle = '#ffffff';
-    ctx.fillRect(0, 0, outW, h);
-    var left = Math.floor((outW - w) / 2);
+    ctx.fillRect(0, 0, baseW, h);
+    var left = Math.floor((baseW - w) / 2);
     ctx.drawImage(it.img, left, 0, w, h);
+    var outW = baseW, outH = h, enlarged = false, name = '_16x9';
+    if (sizeMode() === 'width'){
+      outW = lastW; outH = Math.round(outW * 9 / 16);
+      enlarged = outW > baseW;
+      // 目標の2倍より大きい間は半分ずつ縮小する
+      while (canvas.width > outW * 2){
+        canvas = shrink(canvas, Math.round(canvas.width / 2), Math.round(canvas.height / 2));
+      }
+      canvas = shrink(canvas, outW, outH);
+      left = Math.round(left * outW / baseW);
+      name = '_' + outW + 'x' + outH;
+    }
     var isJpg = fmt() === 'jpg';
     var blob = await toBlob(canvas, isJpg ? 'image/jpeg' : 'image/png', isJpg ? 0.95 : undefined);
     if (!blob) throw new Error('出力に失敗しました');
     if (it.url) URL.revokeObjectURL(it.url);
-    it.blob = blob; it.outW = outW; it.outH = h; it.left = left;
+    it.blob = blob; it.outW = outW; it.outH = outH; it.left = left; it.enlarged = enlarged;
     it.url = URL.createObjectURL(blob);
     var base = it.file.name.replace(/\.[^.]+$/, '');
-    it.outName = base + '_16x9.' + (isJpg ? 'jpg' : 'png');
+    it.outName = base + name + '.' + (isJpg ? 'jpg' : 'png');
+  }
+
+  // 白背景の新しいキャンバスへ指定サイズで描画
+  function shrink(src, tw, th){
+    var c = document.createElement('canvas');
+    c.width = tw; c.height = th;
+    var cx = c.getContext('2d');
+    cx.fillStyle = '#ffffff';
+    cx.fillRect(0, 0, tw, th);
+    cx.imageSmoothingEnabled = true;
+    cx.imageSmoothingQuality = 'high';
+    cx.drawImage(src, 0, 0, tw, th);
+    return c;
   }
 
   async function reprocessAll(){
@@ -165,7 +220,7 @@ button:focus-visible,input:focus-visible{outline:2px solid var(--accent);outline
       } else {
         var im2 = document.createElement('img'); im2.src = it.url; im2.alt = it.outName;
         thumb.appendChild(im2); card.appendChild(thumb);
-        meta.textContent = it.w + '×' + it.h + ' → ' + it.outW + '×' + it.outH + '（左右余白 ' + it.left + 'px）';
+        meta.textContent = it.w + '×' + it.h + ' → ' + it.outW + '×' + it.outH + '（左右余白 ' + it.left + 'px' + (it.enlarged ? '・拡大' : '') + '）';
         card.appendChild(meta);
         var a = document.createElement('a'); a.className = 'btn primary'; a.href = it.url; a.download = it.outName;
         a.textContent = 'ダウンロード'; a.style.textAlign = 'center'; card.appendChild(a);
@@ -212,8 +267,21 @@ button:focus-visible,input:focus-visible{outline:2px solid var(--accent);outline
   });
   drop.addEventListener('drop', function(e){ addFiles(e.dataTransfer.files); });
   document.querySelectorAll('input[name="fmt"]').forEach(function(r){ r.addEventListener('change', reprocessAll); });
+  document.querySelectorAll('input[name="size"]').forEach(function(r){
+    r.addEventListener('change', function(){ updateHint(); reprocessAll(); });
+  });
+  // 不正値の間は再生成せず赤枠にする
+  outwInput.addEventListener('input', function(){
+    var n = readWidth();
+    outwInput.classList.toggle('invalid', n === null);
+    updateHint();
+    if (n === null) return;
+    lastW = n;
+    reprocessAll();
+  });
   zipBtn.addEventListener('click', downloadZip);
   clearBtn.addEventListener('click', clearAll);
+  updateHint();
   render();
 })();
 </script>
